@@ -15,7 +15,6 @@ import textwrap
 import urllib.parse
 from dataclasses import dataclass
 from enum import Enum
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -54,8 +53,10 @@ from workflow_models import (
 )
 
 
-COMPONENT_DIR = Path(__file__).resolve().parent
-DEFAULT_ROOT = COMPONENT_DIR / "runtime" / "Knowledge"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_ROOT = PROJECT_ROOT
+DEFAULT_STATE_DIR_NAME = ".ops-knowledge"
+DEFAULT_PAGES_DIR_NAME = "Pages"
 DEFAULT_TABS_SOURCE_NAME = "browser-tabs"
 DEFAULT_OPERATOR_NAME = "knowledge-worker"
 DEFAULT_LOCAL_EXECUTOR = "local"
@@ -73,42 +74,6 @@ REMOTE_TARGET_PLACEHOLDERS = {
     "user@remote-magic-address",
 }
 
-BLOCK_TAGS = {
-    "address",
-    "article",
-    "aside",
-    "blockquote",
-    "br",
-    "dd",
-    "div",
-    "dl",
-    "dt",
-    "figcaption",
-    "figure",
-    "footer",
-    "form",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "header",
-    "hr",
-    "li",
-    "main",
-    "nav",
-    "ol",
-    "p",
-    "pre",
-    "section",
-    "table",
-    "td",
-    "th",
-    "tr",
-    "ul",
-}
-
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -123,6 +88,14 @@ def relpath_str(path: Path, root: Path) -> str:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def sha256_text(text: str) -> str:
@@ -204,82 +177,66 @@ def build_batch_id(source_kind: str, source_ref: str) -> str:
     return f"batch_{safe_filename(source_kind, fallback='source')}_{now_compact()}_{digest}"
 
 
-class SimpleHTMLExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.in_script = False
-        self.in_style = False
-        self.in_title = False
-        self.title_parts: list[str] = []
-        self.lines: list[str] = []
-        self.buffer: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "noscript"}:
-            self.in_script = True
-            return
-        if tag == "style":
-            self.in_style = True
-            return
-        if tag == "title":
-            self.in_title = True
-            return
-        if tag in BLOCK_TAGS and self.buffer:
-            self.flush()
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "noscript"}:
-            self.in_script = False
-            return
-        if tag == "style":
-            self.in_style = False
-            return
-        if tag == "title":
-            self.in_title = False
-            return
-        if tag in BLOCK_TAGS:
-            self.flush()
-
-    def handle_data(self, data: str) -> None:
-        if self.in_script or self.in_style:
-            return
-        clean = re.sub(r"\s+", " ", data).strip()
-        if not clean:
-            return
-        if self.in_title:
-            self.title_parts.append(clean)
-            return
-        self.buffer.append(clean)
-
-    def flush(self) -> None:
-        if not self.buffer:
-            return
-        line = " ".join(self.buffer).strip()
-        if line:
-            self.lines.append(line)
-        self.buffer = []
-
-    @property
-    def title(self) -> str | None:
-        title = " ".join(self.title_parts).strip()
-        return title or None
+def detect_default_root() -> Path:
+    for start in (Path.cwd(), PROJECT_ROOT):
+        current = start.resolve()
+        for candidate in (current, *current.parents):
+            if (candidate / ".obsidian").exists():
+                return candidate
+    return DEFAULT_ROOT.resolve()
 
 
-def html_to_markdown(html: str, source_url: str) -> tuple[str, str]:
-    parser = SimpleHTMLExtractor()
-    parser.feed(html)
-    parser.flush()
-    title = parser.title or source_url
-    deduped: list[str] = []
-    last = None
-    for line in parser.lines:
-        if line == last:
-            continue
-        deduped.append(line)
-        last = line
-    body = "\n\n".join(deduped)
-    markdown = f"# {title}\n\nSource: {source_url}\n\n{body}\n"
-    return title, markdown
+def load_existing_root_config(root: Path) -> tuple[Path, dict[str, Any]]:
+    candidates = [
+        root / DEFAULT_STATE_DIR_NAME / "config.json",
+        root / "config.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path, load_json(path, {})
+    return candidates[0], {}
+
+
+def resolve_layout_path(root: Path, value: Any) -> Path | None:
+    if not isinstance(value, str):
+        return None
+    clean = value.strip()
+    if not clean:
+        return None
+    path = Path(clean).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (root / path).resolve()
+
+
+def resolve_layout_paths(root: Path, value: Any) -> list[Path]:
+    raw_values = [value] if isinstance(value, str) else value if isinstance(value, list) else []
+    resolved: list[Path] = []
+    for raw in raw_values:
+        path = resolve_layout_path(root, raw)
+        if path is not None and path not in resolved:
+            resolved.append(path)
+    return resolved
+
+
+def choose_layout_path(root: Path, configured: Any, candidates: Iterable[Path], default: Path) -> Path:
+    configured_path = resolve_layout_path(root, configured)
+    if configured_path is not None:
+        return configured_path
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return default.resolve()
+
+
+def detect_obsidian_cli() -> str:
+    discovered = shutil.which("obsidian")
+    if discovered:
+        return discovered
+    local_bin = Path.home() / ".local" / "bin" / "obsidian"
+    if local_bin.exists():
+        return str(local_bin)
+    return "obsidian"
 
 
 def read_source_content(source: str) -> tuple[str, bytes, str]:
@@ -300,6 +257,110 @@ def read_source_content(source: str) -> tuple[str, bytes, str]:
     payload = path.read_bytes()
     mime = "text/html" if path.suffix.lower() in {".html", ".htm"} else "text/plain"
     return str(path.resolve()), payload, mime
+
+
+def resolve_obsidian_settings(config: dict[str, Any]) -> tuple[str, str]:
+    obsidian = config.get("obsidian", {})
+    if not isinstance(obsidian, dict):
+        obsidian = {}
+    cli_path = str(obsidian.get("cli_path") or "").strip() or detect_obsidian_cli()
+    vault_name = str(obsidian.get("vault_name") or "").strip() or Path(config.get("knowledge_root", "")).name
+    return cli_path, vault_name
+
+
+def run_obsidian_eval(code: str, config: dict[str, Any]) -> str:
+    cli_path, vault_name = resolve_obsidian_settings(config)
+    result = subprocess.run(
+        [
+            cli_path,
+            f"vault={vault_name}",
+            "eval",
+            f"code={code}",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "obsidian eval failed").strip()
+        raise RuntimeError(message)
+    output = (result.stdout or "").strip()
+    if output.startswith("=> "):
+        return output[3:].strip()
+    return output
+
+
+def html_to_markdown_via_obsidian(html_path: Path, source_url: str, config: dict[str, Any]) -> tuple[str, str]:
+    code = textwrap.dedent(
+        f"""
+        (() => {{
+          const fs = require("fs");
+          const html = fs.readFileSync({json.dumps(str(html_path))}, "utf8");
+          const sourceUrl = {json.dumps(source_url)};
+          const doc = new DOMParser().parseFromString(html, "text/html");
+          const lines = [];
+          const seen = new Set();
+          const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+          const add = (value) => {{
+            const line = clean(value);
+            if (!line || seen.has(line)) {{
+              return;
+            }}
+            seen.add(line);
+            lines.push(line);
+          }};
+          const title =
+            clean(doc.querySelector("sr-rd-title")?.textContent) ||
+            clean(doc.querySelector("meta[property='og:title']")?.getAttribute("content")) ||
+            clean(doc.querySelector("title")?.textContent) ||
+            sourceUrl;
+          const desc = clean(doc.querySelector("sr-rd-desc")?.textContent);
+          if (desc) {{
+            add(`> ${{desc}}`);
+          }}
+          const root = doc.querySelector("sr-rd-content, article, main, body") || doc.body;
+          const nodes = root.querySelectorAll("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li,figcaption,td,th");
+          const pushNode = (node) => {{
+            const tag = (node.tagName || "").toLowerCase();
+            const text = tag === "pre" ? (node.textContent || "").trim() : clean(node.textContent);
+            if (!text) {{
+              return;
+            }}
+            if (/^h[1-6]$/.test(tag)) {{
+              add(`${{Array(Number(tag.slice(1))).fill("#").join("")}} ${{text}}`);
+              return;
+            }}
+            if (tag === "li") {{
+              add(`- ${{text}}`);
+              return;
+            }}
+            if (tag === "blockquote") {{
+              add(`> ${{text}}`);
+              return;
+            }}
+            if (tag === "pre") {{
+              add(`\\`\\`\\`\\n${{text}}\\n\\`\\`\\``);
+              return;
+            }}
+            add(text);
+          }};
+          if (nodes.length === 0) {{
+            add(root.textContent || "");
+          }} else {{
+            nodes.forEach(pushNode);
+          }}
+          return JSON.stringify({{
+            title,
+            markdown: `# ${{title}}\\n\\nSource: ${{sourceUrl}}\\n\\n${{lines.join("\\n\\n")}}\\n`,
+          }});
+        }})()
+        """
+    ).strip()
+    output = run_obsidian_eval(code, config)
+    payload = json.loads(output)
+    title = str(payload.get("title") or source_url).strip() or source_url
+    markdown = str(payload.get("markdown") or f"# {title}\n\nSource: {source_url}\n").rstrip() + "\n"
+    return title, markdown
 
 
 def extract_title_from_markdown(text: str, fallback: str) -> str:
@@ -405,12 +466,13 @@ def resolve_import_source(
 @dataclass
 class KnowledgePaths:
     root: Path
+    state_dir: Path
     inbox_dir: Path
     inbox_urls: Path
     articles_raw: Path
     articles_markdown: Path
+    articles_markdown_dirs: tuple[Path, ...]
     articles_assets: Path
-    notes_dir: Path
     notes_articles: Path
     notes_extractions: Path
     exports_dir: Path
@@ -424,24 +486,115 @@ class KnowledgePaths:
 
 class KnowledgeStore:
     def __init__(self, root: Path | None = None) -> None:
-        root_path = Path(os.environ.get("KNOWLEDGE_ROOT") or root or DEFAULT_ROOT).expanduser().resolve()
+        root_path = Path(os.environ.get("KNOWLEDGE_ROOT") or root or detect_default_root()).expanduser().resolve()
+        config_path, existing_config = load_existing_root_config(root_path)
+        layout = existing_config.get("layout", {}) if isinstance(existing_config.get("layout"), dict) else {}
+
+        if config_path.parent == root_path:
+            detected_state_dir = root_path
+        elif (root_path / DEFAULT_STATE_DIR_NAME).exists():
+            detected_state_dir = root_path / DEFAULT_STATE_DIR_NAME
+        elif any((root_path / name).exists() for name in ("inbox", "index", "logs", "backups")):
+            detected_state_dir = root_path
+        else:
+            detected_state_dir = root_path / DEFAULT_STATE_DIR_NAME
+        state_dir = choose_layout_path(root_path, layout.get("state_dir"), [detected_state_dir], detected_state_dir)
+
+        legacy_notes_dir = choose_layout_path(
+            root_path,
+            layout.get("notes_dir"),
+            [root_path / "notes", root_path / "Notes"],
+            root_path / "notes",
+        )
+        notes_articles = choose_layout_path(
+            root_path,
+            layout.get("summary_dir"),
+            [
+                state_dir / "summary",
+                legacy_notes_dir / "articles",
+                legacy_notes_dir / "ops-knowledge" / "articles",
+            ],
+            state_dir / "summary",
+        )
+        notes_extractions = choose_layout_path(
+            root_path,
+            layout.get("extractions_dir"),
+            [
+                state_dir / "extractions",
+                legacy_notes_dir / "extractions",
+                legacy_notes_dir / "ops-knowledge" / "extractions",
+            ],
+            state_dir / "extractions",
+        )
+        articles_markdown = choose_layout_path(
+            root_path,
+            layout.get("managed_pages_dir"),
+            [
+                state_dir / "pages",
+                state_dir / "articles" / "markdown",
+            ],
+            state_dir / "pages",
+        )
+        configured_pages_dirs = resolve_layout_paths(root_path, layout.get("pages_dir"))
+        default_pages_dirs = [
+            articles_markdown,
+            root_path / "Pages",
+            root_path / "pages",
+            root_path / "articles" / "markdown",
+            root_path / "SimpRead",
+        ]
+        articles_markdown_dirs = tuple(
+            dict.fromkeys(
+                configured_pages_dirs
+                or [path.resolve() for path in default_pages_dirs if path == articles_markdown or path.exists()]
+                or [articles_markdown]
+            )
+        )
+        articles_raw = choose_layout_path(
+            root_path,
+            layout.get("raw_articles_dir"),
+            [
+                root_path / "articles" / "raw",
+                state_dir / "articles" / "raw",
+            ],
+            state_dir / "articles" / "raw",
+        )
+        articles_assets = choose_layout_path(
+            root_path,
+            layout.get("assets_dir"),
+            [
+                root_path / "articles" / "assets",
+                state_dir / "articles" / "assets",
+            ],
+            state_dir / "articles" / "assets",
+        )
+        exports_dir = choose_layout_path(
+            root_path,
+            layout.get("exports_dir"),
+            [
+                root_path / "exports",
+                state_dir / "exports",
+            ],
+            state_dir / "exports",
+        )
         self.paths = KnowledgePaths(
             root=root_path,
-            inbox_dir=root_path / "inbox",
-            inbox_urls=root_path / "inbox" / "urls.jsonl",
-            articles_raw=root_path / "articles" / "raw",
-            articles_markdown=root_path / "articles" / "markdown",
-            articles_assets=root_path / "articles" / "assets",
-            notes_dir=root_path / "notes",
-            notes_articles=root_path / "notes" / "articles",
-            notes_extractions=root_path / "notes" / "extractions",
-            exports_dir=root_path / "exports",
-            index_dir=root_path / "index",
-            index_db=root_path / "index" / "knowledge.db",
-            logs_dir=root_path / "logs",
-            runs_dir=root_path / "logs" / "runs",
-            backups_dir=root_path / "backups",
-            config_path=root_path / "config.json",
+            state_dir=state_dir,
+            inbox_dir=state_dir / "inbox",
+            inbox_urls=state_dir / "inbox" / "urls.jsonl",
+            articles_raw=articles_raw,
+            articles_markdown=articles_markdown,
+            articles_markdown_dirs=articles_markdown_dirs,
+            articles_assets=articles_assets,
+            notes_articles=notes_articles,
+            notes_extractions=notes_extractions,
+            exports_dir=exports_dir,
+            index_dir=state_dir / "index",
+            index_db=state_dir / "index" / "knowledge.db",
+            logs_dir=state_dir / "logs",
+            runs_dir=state_dir / "logs" / "runs",
+            backups_dir=state_dir / "backups",
+            config_path=state_dir / "config.json",
         )
 
     def default_config(self) -> dict[str, Any]:
@@ -488,23 +641,40 @@ class KnowledgeStore:
                 },
             },
             "backups": {
-                "destination": str((COMPONENT_DIR / "runtime" / "backup_mirror").resolve()),
+                "destination": str((PROJECT_ROOT / "backup_mirror").resolve()),
                 "last_run_at": None,
             },
             "imports": {
                 "library_default_source": "",
                 "tabs_default_source": "",
             },
+            "obsidian": {
+                "cli_path": detect_obsidian_cli(),
+                "vault_name": self.paths.root.name,
+            },
+            "layout": {
+                "state_dir": relpath_str(self.paths.state_dir, self.paths.root),
+                "summary_dir": relpath_str(self.paths.notes_articles, self.paths.root),
+                "extractions_dir": relpath_str(self.paths.notes_extractions, self.paths.root),
+                "managed_pages_dir": relpath_str(self.paths.articles_markdown, self.paths.root),
+                "pages_dir": [relpath_str(path, self.paths.root) for path in self.paths.articles_markdown_dirs],
+                "raw_articles_dir": relpath_str(self.paths.articles_raw, self.paths.root),
+                "assets_dir": relpath_str(self.paths.articles_assets, self.paths.root),
+                "exports_dir": relpath_str(self.paths.exports_dir, self.paths.root),
+            },
+            "indexing": {
+                "include_folders": [".", *[relpath_str(path, self.paths.root) for path in self.paths.articles_markdown_dirs if not is_relative_to(path, self.paths.root)]],
+            },
         }
 
     def ensure_layout(self) -> None:
         for path in [
             self.paths.root,
+            self.paths.state_dir,
             self.paths.inbox_dir,
             self.paths.articles_raw,
             self.paths.articles_markdown,
             self.paths.articles_assets,
-            self.paths.notes_dir,
             self.paths.notes_articles,
             self.paths.notes_extractions,
             self.paths.exports_dir,
@@ -525,6 +695,29 @@ class KnowledgeStore:
         config = merge_defaults(load_json(self.paths.config_path, default_config), default_config)
         if "knowledge_root" not in config:
             config["knowledge_root"] = str(self.paths.root)
+        layout = config.get("layout", {})
+        if not isinstance(layout, dict):
+            layout = {}
+            config["layout"] = layout
+        indexing = config.get("indexing", {})
+        if not isinstance(indexing, dict):
+            indexing = {}
+            config["indexing"] = indexing
+        if isinstance(layout.get("pages_dir"), str):
+            layout["pages_dir"] = [layout["pages_dir"]]
+        include_folders = indexing.get("include_folders")
+        if isinstance(include_folders, list):
+            legacy_roots: list[str] = []
+            legacy_notes_dir = layout.get("notes_dir")
+            if isinstance(legacy_notes_dir, str) and legacy_notes_dir.strip():
+                legacy_roots.append(legacy_notes_dir.strip().split("/", 1)[0])
+            for path in resolve_layout_paths(self.paths.root, layout.get("pages_dir")):
+                relative = relpath_str(path, self.paths.root)
+                if not Path(relative).is_absolute():
+                    legacy_roots.append(relative.split("/", 1)[0])
+            legacy_roots.extend(["SimpRead", "wiki"])
+            if "." not in include_folders and include_folders == list(dict.fromkeys(legacy_roots)):
+                indexing["include_folders"] = default_config["indexing"]["include_folders"]
         return config
 
     def load_urls(self) -> list[dict[str, Any]]:
@@ -785,6 +978,14 @@ def resolve_article_path(store: KnowledgeStore, markdown_path: str) -> Path:
     return article_path
 
 
+def build_article_markdown_path(store: KnowledgeStore, article_id: str) -> Path:
+    return store.paths.articles_markdown / article_id / f"{article_id}.md"
+
+
+def summary_note_path(store: KnowledgeStore, article_id: str) -> Path:
+    return store.paths.notes_articles / f"{article_id}.summary.md"
+
+
 def extraction_note_path(store: KnowledgeStore, article_id: str, template: str, batch_id: str | None) -> Path:
     date_dir = today_iso()
     batch_dir = batch_id or "manual"
@@ -793,7 +994,25 @@ def extraction_note_path(store: KnowledgeStore, article_id: str, template: str, 
 
 def command_init(store: KnowledgeStore, _args: argparse.Namespace) -> int:
     store.ensure_layout()
-    print(json.dumps({"knowledge_root": str(store.paths.root), "status": "initialized"}, indent=2))
+    print(
+        json.dumps(
+            {
+                "knowledge_root": str(store.paths.root),
+                "status": "initialized",
+                "layout": {
+                    "state_dir": relpath_str(store.paths.state_dir, store.paths.root),
+                    "summary_dir": relpath_str(store.paths.notes_articles, store.paths.root),
+                    "extractions_dir": relpath_str(store.paths.notes_extractions, store.paths.root),
+                    "managed_pages_dir": relpath_str(store.paths.articles_markdown, store.paths.root),
+                    "pages_dir": [relpath_str(path, store.paths.root) for path in store.paths.articles_markdown_dirs],
+                    "raw_articles_dir": relpath_str(store.paths.articles_raw, store.paths.root),
+                    "assets_dir": relpath_str(store.paths.articles_assets, store.paths.root),
+                    "exports_dir": relpath_str(store.paths.exports_dir, store.paths.root),
+                },
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -1188,16 +1407,23 @@ def stage_fetch_batch(store: KnowledgeStore, request: FetchBatchRequest) -> Fetc
             article_id = build_article_id(resolved_source, content_hash)
             raw_ext = ".html" if "html" in content_type.lower() else ".txt"
             raw_path = store.paths.articles_raw / f"{article_id}{raw_ext}"
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
             raw_path.write_bytes(payload)
 
             text = payload.decode("utf-8", errors="replace")
             if "html" in content_type.lower():
-                title, markdown = html_to_markdown(text, resolved_source)
+                try:
+                    title, markdown = html_to_markdown_via_obsidian(raw_path, resolved_source, config)
+                except Exception:
+                    title = resolved_source
+                    body = re.sub(r"\s+", " ", text).strip()
+                    markdown = f"# {title}\n\nSource: {resolved_source}\n\n{body}\n"
             else:
                 title = extract_title_from_markdown(text, fallback=resolved_source)
                 markdown = text
 
-            md_path = store.paths.articles_markdown / f"{article_id}.md"
+            md_path = build_article_markdown_path(store, article_id)
+            md_path.parent.mkdir(parents=True, exist_ok=True)
             md_path.write_text(markdown, encoding="utf-8")
 
             article_record = {
@@ -1470,7 +1696,7 @@ def article_paths_for_batch(store: KnowledgeStore, batch_id: str | None) -> list
         if not markdown_path:
             article_id = str(row.get("article_id", "")).strip()
             if article_id:
-                markdown_path = f"articles/markdown/{article_id}.md"
+                markdown_path = relpath_str(build_article_markdown_path(store, article_id), store.paths.root)
         if not markdown_path or markdown_path in seen:
             continue
         path = resolve_article_path(store, markdown_path)
@@ -1499,7 +1725,8 @@ def stage_summarize_batch(store: KnowledgeStore, request: SummarizeBatchRequest,
                 if batch_id:
                     row["batch_id"] = batch_id
                 break
-        note_path = store.paths.notes_articles / f"{article_id}.summary.md"
+        note_path = summary_note_path(store, article_id)
+        note_path.parent.mkdir(parents=True, exist_ok=True)
         note = build_note_markdown(
             article_id=article_id,
             title=title,
@@ -1842,15 +2069,54 @@ def open_index(db_path: Path) -> sqlite3.Connection:
 
 
 def collect_index_documents(store: KnowledgeStore) -> list[dict[str, str]]:
+    config = store.load_config()
+    include_roots: list[Path] = []
+    indexing = config.get("indexing", {})
+    configured_roots = indexing.get("include_folders", []) if isinstance(indexing, dict) else []
+    if isinstance(configured_roots, list):
+        for value in configured_roots:
+            path = resolve_layout_path(store.paths.root, value)
+            if path is not None and path.exists():
+                include_roots.append(path)
+    if not include_roots:
+        include_roots = list(
+            dict.fromkeys(
+                [
+                    store.paths.root,
+                    *[path for path in store.paths.articles_markdown_dirs if not is_relative_to(path, store.paths.root)],
+                ]
+            )
+        )
+    excluded_roots = [
+        store.paths.inbox_dir,
+        store.paths.index_dir,
+        store.paths.logs_dir,
+        store.paths.backups_dir,
+        store.paths.articles_raw,
+        store.paths.articles_assets,
+    ]
     candidates: list[Path] = []
-    for root in [store.paths.notes_dir, store.paths.articles_markdown, store.paths.exports_dir]:
+    seen_candidates: set[Path] = set()
+    for root in include_roots:
         if root.exists():
-            candidates.extend(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in {".md", ".txt"})
+            for path in root.rglob("*"):
+                if not path.is_file() or path.suffix.lower() not in {".md", ".txt"}:
+                    continue
+                resolved = path.resolve()
+                if any(is_relative_to(resolved, excluded_root) for excluded_root in excluded_roots):
+                    continue
+                if resolved in seen_candidates:
+                    continue
+                candidates.append(resolved)
+                seen_candidates.add(resolved)
     docs: list[dict[str, str]] = []
     for path in sorted(candidates):
         body = path.read_text(encoding="utf-8", errors="replace")
         title = extract_title_from_markdown(body, fallback=path.stem)
-        kind = path.relative_to(store.paths.root).parts[0]
+        if is_relative_to(path, store.paths.root):
+            kind = path.relative_to(store.paths.root).parts[0]
+        else:
+            kind = safe_filename(path.parent.name, fallback="external")
         docs.append(
             {
                 "path": relpath_str(path, store.paths.root),
@@ -2117,6 +2383,7 @@ def stage_status(store: KnowledgeStore, request: StatusRequest) -> StatusResult:
         },
         "backups": config.get("backups", {}),
         "routing_defaults": config.get("routing_defaults", {}),
+        "obsidian": config.get("obsidian", {}),
         "remote_access": {
             "transport": config.get("remote_access", {}).get("transport", "tailscale-ssh"),
             "executors": remote_targets,
@@ -2161,6 +2428,11 @@ def stage_doctor(store: KnowledgeStore, request: DoctorRequest) -> DoctorResult:
     backup_destination = Path(config.get("backups", {}).get("destination", ""))
     if backup_destination and not backup_destination.exists():
         issues.append(f"Backup destination does not exist yet: {backup_destination}")
+    cli_path, vault_name = resolve_obsidian_settings(config)
+    if shutil.which(cli_path) is None and not Path(cli_path).expanduser().exists():
+        issues.append(f"Obsidian CLI not found: {cli_path}")
+    if not vault_name:
+        issues.append("Obsidian vault_name is not configured")
     try:
         conn = open_index(store.paths.index_db)
         conn.close()

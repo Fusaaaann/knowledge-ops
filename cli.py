@@ -93,7 +93,7 @@ def add_primitive_parsers(
     subparsers.add_parser(
         "init",
         help=primitive_help,
-        description="Create the runtime directory layout and default config.json.",
+        description="Discover the current vault layout, create only missing app-owned paths, and write config.json.",
     )
 
     capture = subparsers.add_parser(
@@ -125,7 +125,7 @@ def add_primitive_parsers(
     fetch = subparsers.add_parser(
         "fetch-new",
         help=primitive_help,
-        description="Fetch inbox items with status `new` into raw and markdown article storage.",
+        description="Fetch inbox items with status `new` into the raw store and the configured vault page directory.",
     )
     fetch.add_argument("--limit", type=int, default=20, help="Maximum number of `new` inbox items to fetch.")
     fetch.add_argument("--executor", help="Executor label to record on fetched items. When omitted, routing defaults choose one from config.json.")
@@ -203,7 +203,7 @@ def add_primitive_parsers(
         description="Index management commands.",
     )
     index_subparsers = index.add_subparsers(dest="index_command", required=True, metavar="index_command")
-    index_subparsers.add_parser("update", help=primitive_help, description="Rebuild the SQLite document index from notes/, articles/markdown/, and exports/.")
+    index_subparsers.add_parser("update", help=primitive_help, description="Rebuild the SQLite document index from the configured vault content folders.")
 
     search = subparsers.add_parser(
         "search",

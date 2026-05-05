@@ -5,4 +5,4 @@ __pycache__/
 .mypy_cache/
 
 # Generated knowledge data and operator-local state
-runtime/
+config.json

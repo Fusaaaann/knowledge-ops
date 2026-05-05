@@ -11,7 +11,7 @@ Compatibility shim: `./knowledge`
 Default root:
 
 ```text
-components/ops-knowledge/runtime/Knowledge
+components/ops-knowledge/Knowledge
 ```
 
 Override:
@@ -59,8 +59,8 @@ Primitive commands still work directly for agents and power users.
 
 `from-library [SOURCE]`
 
-- Import current library source into `exports/library/`.
-- Normalize text files.
+- Import a local filesystem content tree into `exports/library/`.
+- Assumes `SOURCE` is a directory of files, not a library database or API export: every file is mirrored into `exports/library/raw/`, and only `.md` and `.txt` files are normalized into `exports/library/normalized/`.
 - Refresh index.
 - Source must be passed explicitly or configured in `config.json`.
 
@@ -123,15 +123,17 @@ This file defines request and result models for:
 
 `./ops-knowledge init` creates:
 
-- `inbox/urls.jsonl`
-- `articles/raw/`
-- `articles/markdown/`
-- `notes/articles/`
-- `notes/extractions/`
-- `exports/`
-- `index/knowledge.db`
-- `logs/`
-- `config.json`
+- `.ops-knowledge/inbox/urls.jsonl`
+- `.ops-knowledge/articles/raw/`
+- `.ops-knowledge/pages/`
+- `.ops-knowledge/summary/`
+- `.ops-knowledge/extractions/`
+- `.ops-knowledge/exports/`
+- `.ops-knowledge/index/knowledge.db`
+- `.ops-knowledge/logs/`
+- `.ops-knowledge/config.json`
+
+Additional page roots may also be indexed via `layout.pages_dir`, for example `Pages/` or `SimpRead/`.
 
 Workflow runs add:
 
@@ -139,8 +141,8 @@ Workflow runs add:
 
 Notes include run metadata:
 
-- summary notes stay under `notes/articles/`
-- extraction notes go under `notes/extractions/<date>/<batch_id>/`
+- summary notes stay under `.ops-knowledge/summary/`
+- extraction notes go under `.ops-knowledge/extractions/<date>/<batch_id>/`
 
 ## Primitive Commands
 
